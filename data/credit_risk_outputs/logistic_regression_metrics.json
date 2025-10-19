@@ -1,0 +1,18 @@
+{
+  "model": "logistic_regression",
+  "AUC": 0.7317073170731707,
+  "AP": 0.04224738675958188,
+  "KS": 0.6829268292682926,
+  "best_threshold_KS": 0.1702557803353666,
+  "confusion_matrix": [
+    [
+      84,
+      39
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n           0     1.0000    0.6829    0.8116       123\n           1     0.0488    1.0000    0.0930         2\n\n    accuracy                         0.6880       125\n   macro avg     0.5244    0.8415    0.4523       125\nweighted avg     0.9848    0.6880    0.8001       125\n"
+}

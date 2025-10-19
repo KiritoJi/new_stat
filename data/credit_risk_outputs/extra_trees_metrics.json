@@ -1,0 +1,18 @@
+{
+  "model": "extra_trees",
+  "AUC": 0.6585365853658537,
+  "AP": 0.03214285714285714,
+  "KS": 0.5609756097560976,
+  "best_threshold_KS": 0.01,
+  "confusion_matrix": [
+    [
+      69,
+      54
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n           0     1.0000    0.5610    0.7188       123\n           1     0.0357    1.0000    0.0690         2\n\n    accuracy                         0.5680       125\n   macro avg     0.5179    0.7805    0.3939       125\nweighted avg     0.9846    0.5680    0.7084       125\n"
+}
