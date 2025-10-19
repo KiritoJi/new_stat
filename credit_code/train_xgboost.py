@@ -37,7 +37,7 @@ train = add_business_features(normalize_columns(pd.read_excel(TRAIN)))
 test  = add_business_features(normalize_columns(pd.read_excel(TEST)))
 sample = pd.read_csv(SAMPLE)
 
-#plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']  # 显示中文标签，苹果电脑
+plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']  # 显示中文标签，苹果电脑
 plt.rcParams['axes.unicode_minus'] = False # 解决保存图像是负号'-'显示为方块的问题
 
 target_col = "target"

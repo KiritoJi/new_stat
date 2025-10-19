@@ -1,11 +1,7 @@
 # run_all.py
+
 import subprocess, sys
 
-print("=== Logistic Regression ===")
-subprocess.run([sys.executable, "train_logistic.py"], check=False)
-
-print("\n=== Extra Trees ===")
-subprocess.run([sys.executable, "train_extratrees.py"], check=False)
-
-print("\n=== XGBoost ===")
-subprocess.run([sys.executable, "train_xgboost.py"], check=False)
+for name in ["train_logistic.py", "train_extratrees.py", "train_xgboost.py", "train_linear_regression.py"]:
+    print(f"\n=== Running {name} ===")
+    subprocess.run([sys.executable, name], check=False)
