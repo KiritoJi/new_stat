@@ -1,143 +1,158 @@
 # -*- coding: utf-8 -*-
-import os, sys, subprocess, pandas as pd, re, numpy as np, matplotlib.pyplot as plt
+"""
+Run all models and fuse predictions.
+Outputs (kept as before):
+- submission_ensemble.csv  : 融合后的提交
+- model_comparison_plot.png: 各模型指标对比
+This script assumes single-model scripts have already produced their submissions
+and optional OOF files under OUT.
+"""
+import os, sys, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
-# ===============================
-# 路径
-# ===============================
+# ======== Paths (keep original style with robust fallback) ========
 BASE_DIR = "/Users/krt/krt files/Github/new_stat/credit_code"
-ROOT_DIR = os.path.dirname(BASE_DIR)   # /Users/krt/krt files/Github/new_stat
+ROOT_DIR = os.path.dirname(BASE_DIR) if os.path.exists(BASE_DIR) else os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT = os.path.join(ROOT_DIR, "outputs")
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 os.makedirs(OUT, exist_ok=True)
 
-# ===============================
-# 模型脚本
-# ===============================
-scripts = [
-    "train_logistic.py",
-    "train_extratrees.py",
-    "train_xgboost.py",
-    "train_linear_regression.py"
-]
+# ======== Helper ========
+def ks_score(y_true, y_prob):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    return float(np.max(np.abs(tpr - fpr)))
 
-# ===============================
-# 运行&解析
-# ===============================
-def run_script(script):
-    print(f"\n🚀 正在运行模型脚本：{script}")
-    result = subprocess.run([sys.executable, os.path.join(BASE_DIR, script)],
-                            capture_output=True, text=True)
-    print(result.stdout)
-    if result.stderr.strip():
-        print("⚠️ 错误信息：\n", result.stderr)
-    return result.stdout
+def read_submission(name):
+    p = os.path.join(OUT, f"submission_{name}.csv")
+    if os.path.exists(p):
+        df = pd.read_csv(p)
+        assert {"id","target"}.issubset(df.columns), f"{p} must have id,target"
+        return df
+    return None
 
-def parse_metrics(log_text):
-    metrics = {"AUC": np.nan, "AP": np.nan, "KS": np.nan}
-    m = re.search(r"AUC=([\d\.]+).*AP=([\d\.]+).*KS=([\d\.]+)", log_text)
-    if m:
-        metrics = {"AUC": float(m.group(1)), "AP": float(m.group(2)), "KS": float(m.group(3))}
-    return metrics
+def read_oof(name):
+    p = os.path.join(OUT, f"oof_{name}.csv")
+    if os.path.exists(p):
+        df = pd.read_csv(p)
+        return df
+    return None
 
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+def safe_metric_from_oof(df):
+    try:
+        y = df["target"].values
+        o = df["oof"].values
+        auc = roc_auc_score(y, o)
+        ap = average_precision_score(y, o)
+        ks = ks_score(y, o)
+        return {"AUC": auc, "AP": ap, "KS": ks}
+    except Exception:
+        return {"AUC": np.nan, "AP": np.nan, "KS": np.nan}
 
-# ===============================
-# 训练各模型
-# ===============================
-results = {}
-for s in scripts:
-    out_text = run_script(s)
-    results[s.replace(".py","")] = parse_metrics(out_text)
+def main():
+    print(">>> Run all & ensemble")
+    # Load individual submissions
+    names = ["logistic", "extratrees", "xgboost"]
+    subs = {n: read_submission(n) for n in names}
+    subs = {k:v for k,v in subs.items() if v is not None}
+    if not subs:
+        print("⚠️ 未发现单模型提交文件，请先运行各训练脚本（train_*.py）。")
+        return
 
-# ===============================
-# 加载预测文件
-# ===============================
-files = {
-    "logistic": os.path.join(OUT, "submission_logistic_regression.csv"),
-    "extratrees": os.path.join(OUT, "submission_extra_trees.csv"),
-    "xgboost": os.path.join(OUT, "submission_xgboost.csv"),
-    "linear": os.path.join(OUT, "submission_linear_regression.csv")
-}
-dfs = {k: pd.read_csv(p) for k,p in files.items() if os.path.exists(p)}
-if not dfs:
-    raise RuntimeError("❌ 没有找到任何模型输出，无法融合。")
+    # Align by id
+    ids = None
+    for n, df in subs.items():
+        ids = df["id"].values if ids is None else ids
+        if not np.array_equal(ids, df["id"].values):
+            df.sort_values("id", inplace=True); df.reset_index(drop=True, inplace=True)
+    # read sample to keep original order if needed
+    sample_path = os.path.join(DATA_DIR, "提交样例.csv")
+    if os.path.exists(sample_path):
+        sample = pd.read_csv(sample_path)
+        order = sample["id"].values
+        for n in subs:
+            subs[n] = subs[n].set_index("id").loc[order].reset_index()
 
-# 自动选择两个最优模型（按 AUC）
-df_compare = pd.DataFrame(results).T
-top2 = df_compare["AUC"].sort_values(ascending=False).head(2).index.tolist()
-# 名称映射：train_xxx -> xxx
-best_keys = [name.replace("train_","") for name in top2 if name.replace("train_","") in dfs]
-if len(best_keys) < 2:
-    # 兜底：若某个最优模型没有成功输出，就用可用的前两个
-    best_keys = list(dfs.keys())[:2]
-print(f"\n🏆 参与融合的两个最佳模型：{best_keys}")
+    # Read OOF for weighting
+    metrics = {}
+    for n in subs.keys():
+        oof_df = read_oof(n)
+        if oof_df is not None:
+            metrics[n] = safe_metric_from_oof(oof_df)
+        else:
+            metrics[n] = {"AUC": np.nan, "AP": np.nan, "KS": np.nan}
 
-# ID 对齐
-main_key = best_keys[0]
-ids = dfs[main_key]["id"]
-for k in best_keys:
-    dfs[k] = dfs[k].set_index("id").reindex(ids).reset_index()
+    # Compute weights based on AUC (fallback to equal)
+    aucs = {k: v["AUC"] for k,v in metrics.items() if not np.isnan(v["AUC"])}
+    if aucs:
+        # emphasize better models using softmax of AUC*10
+        score_vec = np.array([aucs[k] for k in subs.keys()])
+        w = np.exp(score_vec*10)  # sharp
+        w = w / w.sum()
+        weights = {k: float(w[i]) for i,k in enumerate(subs.keys())}
+    else:
+        k = len(subs)
+        weights = {n: 1.0/k for n in subs.keys()}
 
-# 权重（按 AUC 比例）
-auc_dict = {k: df_compare.loc[f"train_{k}", "AUC"] if f"train_{k}" in df_compare.index else 0 for k in best_keys}
-sum_auc = sum(auc_dict.values())
-weights = {k: (v/sum_auc if sum_auc>0 else 1/len(best_keys)) for k,v in auc_dict.items()}
-print("\n📦 融合权重（按AUC自适应）：", weights)
+    print("[Weights]", json.dumps(weights, ensure_ascii=False, indent=2))
 
-# 生成融合结果
-ensemble_prob = np.zeros(len(ids), dtype=float)
-for k in best_keys:
-    ensemble_prob += dfs[k]["target"].values * weights[k]
-sub_ens = pd.DataFrame({"id": ids, "target": ensemble_prob})
-ens_path = os.path.join(OUT, "submission_ensemble.csv")
-sub_ens.to_csv(ens_path, index=False)
-print(f"✅ 已生成融合预测文件：{ens_path}")
+    # Weighted average ensemble
+    ens = None
+    for n, df in subs.items():
+        p = df["target"].values.astype(float)
+        ens = p*weights[n] if ens is None else ens + p*weights[n]
 
-# 计算融合指标（在训练集上）
-train_path = os.path.join(DATA_DIR, "训练数据集.xlsx")
-if os.path.exists(train_path):
-    train = pd.read_excel(train_path, sheet_name=0)
-    if "target" in train.columns:
-        y_true = train["target"].astype(int).values
-        y_pred = ensemble_prob[:len(y_true)]
-        auc = roc_auc_score(y_true, y_pred)
-        ap = average_precision_score(y_true, y_pred)
-        fpr, tpr, _ = roc_curve(y_true, y_pred)
-        ks = np.max(np.abs(tpr - fpr))
-        print(f"📊 融合（Top-2）评估：AUC={auc:.4f}  AP={ap:.4f}  KS={ks:.4f}")
+    sub_ens = pd.DataFrame({"id": subs[next(iter(subs))]["id"].values, "target": ens})
+    ens_path = os.path.join(OUT, "submission_ensemble.csv")
+    sub_ens.to_csv(ens_path, index=False, float_format="%.8f", encoding="utf-8")
+    print(f"✅ 已生成融合预测文件：{ens_path}")
 
-        plt.figure(figsize=(6,5))
-        plt.plot(fpr, tpr, label=f"AUC={auc:.4f}, KS={ks:.4f}")
-        plt.plot([0,1],[0,1],"--",color="gray")
-        plt.xlabel("假阳性率 (FPR)"); plt.ylabel("真阳性率 (TPR)")
-        plt.title("融合模型 ROC 曲线（Top-2）"); plt.legend()
-        plt.tight_layout(); plt.savefig(os.path.join(OUT,"ensemble_roc_curve.png"), dpi=220); plt.close()
+    # Draw comparison plot
+    dfc = []
+    for n, m in metrics.items():
+        dfc.append({"model": n, **m})
+    dfc = pd.DataFrame(dfc).set_index("model")
+    # Add Ensemble metrics if we can evaluate on train
+    train_path = os.path.join(DATA_DIR, "训练数据集.xlsx")
+    if os.path.exists(train_path):
+        # If we have OOFs for all models, approximate ensemble OOF by weighted sum of OOF
+        have_all_oof = all(read_oof(n) is not None for n in subs.keys())
+        if have_all_oof:
+            oofs = [read_oof(n).set_index("id")["oof"] for n in subs.keys()]
+            ids_train = oofs[0].index
+            oof_mat = np.vstack([s.loc[ids_train].values for s in oofs]).T
+            w = np.array([weights[n] for n in subs.keys()])
+            oof_ens = (oof_mat @ w)
+            y = read_oof(next(iter(subs.keys())))["target"].values
+            dfc.loc["ensemble","AUC"] = roc_auc_score(y, oof_ens)
+            dfc.loc["ensemble","AP"]  = average_precision_score(y, oof_ens)
+            dfc.loc["ensemble","KS"]  = ks_score(y, oof_ens)
 
-        results["ensemble_top2"] = {"AUC": auc, "AP": ap, "KS": ks}
+    # Plot
+    if not dfc.empty:
+        cols = ["AUC","AP","KS"]
+        fig, axes = plt.subplots(1, len(cols), figsize=(5*len(cols), 4))
+        if len(cols)==1: axes=[axes]
+        for i,c in enumerate(cols):
+            if c in dfc.columns:
+                ax=axes[i]
+                dfc[c].plot(kind="bar", ax=ax)
+                ax.set_title(c); ax.set_xlabel("Model"); ax.set_ylabel(c)
+                ax.grid(axis="y", linestyle="--", alpha=0.5)
+                for j,v in enumerate(dfc[c].values):
+                    if not np.isnan(v):
+                        ax.text(j, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+        plt.suptitle("各模型性能对比（含融合）")
+        plt.tight_layout(rect=[0,0,1,0.93])
+        plot_path = os.path.join(OUT, "model_comparison_plot.png")
+        plt.savefig(plot_path, dpi=220); plt.close()
+        print(f"📈 模型性能对比图已保存：{plot_path}")
+    else:
+        print("⚠️ 无对比数据，未绘图。")
 
-# 汇总表 + 中文图
-cmp_path = os.path.join(OUT, "model_comparison.csv")
-pd.DataFrame(results).T.to_csv(cmp_path, index_label="模型名称")
-print(f"\n✅ 模型性能对比表已保存：{cmp_path}")
+    print("\n🎯 全流程完成。输出目录：", OUT)
 
-dfc = pd.read_csv(cmp_path, index_col=0)
-if not dfc.empty:
-    fig, axes = plt.subplots(1,3, figsize=(15,5))
-    metrics = ["AUC","AP","KS"]; colors=["#409EFF","#67C23A","#E6A23C"]
-    for i,m in enumerate(metrics):
-        ax = axes[i]
-        if m in dfc.columns:
-            dfc[m].plot(kind="bar", ax=ax, color=colors[i])
-            ax.set_title(f"{m} 指标对比"); ax.set_xlabel("模型"); ax.set_ylabel(m)
-            ax.grid(axis="y", linestyle="--", alpha=0.6)
-            for idx, val in enumerate(dfc[m].values):
-                if pd.notna(val): ax.text(idx, val, f"{val:.3f}", ha="center", va="bottom", fontsize=9)
-    plt.suptitle("各模型性能对比图（含 Top-2 融合）")
-    plt.tight_layout(rect=[0,0,1,0.95]); plt.savefig(os.path.join(OUT,"model_comparison_plot.png"), dpi=220); plt.close()
-    print(f"📈 模型性能对比图已保存：{os.path.join(OUT,'model_comparison_plot.png')}")
-else:
-    print("⚠️ 无对比数据，未绘图。")
-
-print("\n🎯 全流程完成。输出目录：", OUT)
+if __name__ == "__main__":
+    main()

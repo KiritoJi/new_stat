@@ -1,132 +1,214 @@
 # -*- coding: utf-8 -*-
-import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+"""
+XGBoost with WOE/IV + class imbalance handling + CV OOF
+Outputs:
+- submission_xgboost.csv to OUT
+"""
+import os, json, math, warnings
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
-from xgboost import XGBClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.pipeline import Pipeline as SkPipeline
 
+from xgboost import XGBClassifier
+try:
+    from imblearn.pipeline import Pipeline
+    from imblearn.under_sampling import RandomUnderSampler
+except Exception:
+    Pipeline = SkPipeline
+    RandomUnderSampler = None
+
+import matplotlib.pyplot as plt
+
+# Paths
 BASE_DIR = "/Users/krt/krt files/Github/new_stat/credit_code"
-ROOT_DIR = os.path.dirname(BASE_DIR)
+ROOT_DIR = os.path.dirname(BASE_DIR) if os.path.exists(BASE_DIR) else os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 OUT = os.path.join(ROOT_DIR, "outputs")
 os.makedirs(OUT, exist_ok=True)
 
-TRAIN = os.path.join(DATA_DIR, "训练数据集.xlsx")
-TEST = os.path.join(DATA_DIR, "测试集.xlsx")
-SAMPLE = os.path.join(DATA_DIR, "提交样例.csv")
-target_col = "target"
+TRAIN_XLSX = os.path.join(DATA_DIR, "训练数据集.xlsx")
+TEST_XLSX  = os.path.join(DATA_DIR, "测试集.xlsx")
+SAMPLE_CSV = os.path.join(DATA_DIR, "提交样例.csv")
 
-def normalize_columns(df): df=df.copy(); df.columns=[str(c).strip().lower() for c in df.columns]; return df
+RANDOM_STATE = 42
+N_SPLITS = 5
 
-def learn_high_risk_purpose(train_df: pd.DataFrame):
-    if "purpose" not in train_df.columns: return set()
-    grp = train_df.groupby("purpose")[target_col].mean()
-    gmean, gstd = train_df[target_col].mean(), train_df[target_col].std(ddof=0)
-    if pd.isna(gstd) or gstd < 1e-6:
-        return set(grp.sort_values(ascending=False).head(3).index)
-    high = set(grp[grp >= gmean + gstd].index)
-    return high if len(high)>0 else set(grp.sort_values(ascending=False).head(2).index)
-
-def add_business_features(df: pd.DataFrame, high_risk=set()) -> pd.DataFrame:
-    df = df.copy()
-    for c in ["purpose","housing"]:
-        if c in df.columns: df[c]=df[c].astype(str).str.lower()
-    if "amount" in df.columns and "income" in df.columns:
-        inc = df["income"].replace(0,np.nan).astype(float)
-        df["loan_income_ratio"] = (df["amount"].astype(float)/inc).fillna(0).clip(0,100)
-    if "credict_used_amount" in df.columns and "credict_limit" in df.columns:
-        lim = df["credict_limit"].replace(0,np.nan).astype(float)
-        df["credit_utilization_ratio"]=(df["credict_used_amount"].astype(float)/lim).fillna(0).clip(0,10)
-    if "amount" in df.columns and "credict_limit" in df.columns:
-        lim = df["credict_limit"].replace(0,np.nan).astype(float)
-        df["amount_to_limit"]=(df["amount"].astype(float)/lim).fillna(0).clip(0,100)
-    for c in ["last_overdue_months","last_credict_card_months"]:
-        if c in df.columns:
-            s=df[c].astype(float)
-            df[f"inv_{c}"]=(1/(1+s.fillna(s.median()))).clip(0,1)
-    if "overdue_times" in df.columns and "default_times" in df.columns:
-        df["risk_exposure_index"]=df["overdue_times"].fillna(0).astype(float)+2*df["default_times"].fillna(0).astype(float)
-    if "housing" in df.columns:
-        df["is_rent"]=df["housing"].eq("rent").astype(int); df["is_own"]=df["housing"].eq("own").astype(int)
-    if "purpose" in df.columns:
-        df["purpose_risk_flag"]=df["purpose"].isin(high_risk).astype(int)
-    if "loan_income_ratio" in df.columns and "is_rent" in df.columns:
-        df["int_ratio_rent"]=df["loan_income_ratio"]*df["is_rent"]
-    if "credit_utilization_ratio" in df.columns and "inv_last_overdue_months" in df.columns:
-        df["int_util_recentoverdue"]=df["credit_utilization_ratio"]*df["inv_last_overdue_months"]
-    if "income" in df.columns:
-        df["log_income"]=np.log1p(df["income"].astype(float))
-    return df
-
-def ks_score(y_true, y_prob):
+def ks_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     return float(np.max(np.abs(tpr - fpr)))
 
-train_raw = normalize_columns(pd.read_excel(TRAIN, sheet_name=0))
-test_raw = normalize_columns(pd.read_excel(TEST, sheet_name=0))
-hrp = learn_high_risk_purpose(train_raw)
-train = add_business_features(train_raw, hrp)
-test = add_business_features(test_raw, hrp)
-sample = pd.read_csv(SAMPLE)
+@dataclass
+class BinSpec:
+    edges: np.ndarray
+    is_categorical: bool = False
+    categories_: Dict[str, float] = None
 
-cat_cols = [c for c in train.columns if train[c].dtype=="object" and c!=target_col]
-num_cols = [c for c in train.columns if c not in cat_cols + [target_col]]
-if "id" in num_cols: num_cols.remove("id")
+class WOETransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, max_bins: int = 10, min_bin_frac: float = 0.03, rare_frac: float = 0.01, alpha: float = 0.5):
+        self.max_bins = max_bins
+        self.min_bin_frac = min_bin_frac
+        self.rare_frac = rare_frac
+        self.alpha = alpha
+        self.bin_specs_: Dict[str, BinSpec] = {}
+        self.iv_table_: pd.DataFrame = pd.DataFrame()
 
-X, y = train[cat_cols+num_cols], train[target_col].astype(int)
-X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        X = X.copy(); y = pd.Series(y).reset_index(drop=True)
+        n = len(y); total_bad = float(np.sum(y==1)); total_good = float(np.sum(y==0)); eps=1e-9
+        iv_records = []
+        for col in X.columns:
+            s = X[col]
+            if s.dtype == "O":
+                vc = s.fillna("__MISSING__").astype(str).value_counts(normalize=True)
+                rare = set(vc[vc < self.rare_frac].index.tolist())
+                s2 = s.fillna("__MISSING__").astype(str).map(lambda v: v if v not in rare else "__RARE__")
+                woe_map = {}; ivc = 0.0
+                for cat,_ in s2.value_counts().items():
+                    m = (s2==cat)
+                    bad=float(np.sum(y[m]==1)); good=float(np.sum(y[m]==0))
+                    woe = np.log(((bad+self.alpha)/(total_bad+self.alpha))/((good+self.alpha)/(total_good+self.alpha)+eps)+eps)
+                    woe_map[cat]=woe
+                    ivc += ((bad/(total_bad+eps))-(good/(total_good+eps)))*woe
+                self.bin_specs_[col]=BinSpec(edges=np.array([]), is_categorical=True, categories_=woe_map)
+                iv_records.append({"feature": col, "IV": ivc})
+            else:
+                s1 = s.astype(float)
+                qs = np.unique(np.nanquantile(s1, q=np.linspace(0,1,self.max_bins+1), interpolation="linear"))
+                edges = np.unique(np.concatenate(([-np.inf], qs[1:-1], [np.inf])))
+                if len(edges)<=2: edges=np.array([-np.inf, np.inf])
+                b = pd.cut(s1, bins=edges, right=True, include_lowest=True)
+                bc = b.value_counts(dropna=False).sort_index()
+                while (bc/n).min()<self.min_bin_frac and len(bc)>2:
+                    idx=np.argmin(bc.values)
+                    if idx==0: edges=np.delete(edges,1)
+                    else: edges=np.delete(edges,idx+1)
+                    b = pd.cut(s1, bins=edges, right=True, include_lowest=True)
+                    bc = b.value_counts(dropna=False).sort_index()
+                ivc=0.0; wmap={}
+                b2 = pd.cut(s1, bins=edges, right=True, include_lowest=True)
+                for inter,_ in b2.value_counts().sort_index().items():
+                    m=(b2==inter)
+                    bad=float(np.sum(y[m]==1)); good=float(np.sum(y[m]==0))
+                    woe=np.log(((bad+self.alpha)/(total_bad+self.alpha))/((good+self.alpha)/(total_good+self.alpha)+eps)+eps)
+                    wmap[str(inter)]=woe
+                    ivc += ((bad/(total_bad+eps))-(good/(total_good+eps)))*woe
+                self.bin_specs_[col]=BinSpec(edges=np.array(edges), is_categorical=False, categories_=wmap)
+                iv_records.append({"feature": col, "IV": ivc})
+        self.iv_table_=pd.DataFrame(iv_records).sort_values("IV", ascending=False).reset_index(drop=True)
+        return self
 
-num_tf = Pipeline([("imp", SimpleImputer(strategy="median"))])
-cat_tf = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore"))])
-pre = ColumnTransformer([("num", num_tf, num_cols), ("cat", cat_tf, cat_cols)])
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame(index=X.index)
+        for col, spec in self.bin_specs_.items():
+            s = X[col]
+            if spec.is_categorical:
+                s2 = s.fillna("__MISSING__").astype(str)
+                mapped = s2.map(lambda v: v if v in spec.categories_ else "__RARE__")
+                out[col] = mapped.map(spec.categories_).fillna(0.0).astype(float)
+            else:
+                s1 = s.astype(float)
+                b = pd.cut(s1, bins=spec.edges, right=True, include_lowest=True)
+                out[col] = b.astype(str).map(spec.categories_).fillna(0.0).astype(float)
+        return out
 
-pos = int(np.sum(y_train==1)); neg = int(np.sum(y_train==0))
-spw = float(neg / max(pos, 1))
+def load_data():
+    train = pd.read_excel(TRAIN_XLSX)
+    test  = pd.read_excel(TEST_XLSX)
+    sample = pd.read_csv(SAMPLE_CSV)
+    return train, test, sample
 
-clf = Pipeline([
-    ("pre", pre),
-    ("clf", XGBClassifier(
-        n_estimators=600,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
+def main():
+    print(">>> XGBoost with WOE + class imbalance")
+    train, test, sample = load_data()
+    target="target"; id_col="id"
+    feats=[c for c in train.columns if c not in [target,id_col]]
+    cat_cols=[c for c in feats if train[c].dtype=="O"]
+    num_cols=[c for c in feats if c not in cat_cols]
+
+    imp_num=SimpleImputer(strategy="median")
+    imp_cat=SimpleImputer(strategy="most_frequent")
+
+    X_num=pd.DataFrame(imp_num.fit_transform(train[num_cols]), columns=num_cols, index=train.index)
+    X_cat=pd.DataFrame(imp_cat.fit_transform(train[cat_cols]), columns=cat_cols, index=train.index) if cat_cols else pd.DataFrame(index=train.index)
+    X=pd.concat([X_cat, X_num], axis=1)
+    y=train[target].astype(int).values
+
+    pos=int(np.sum(y==1)); neg=int(np.sum(y==0))
+    scale_pos_weight = max(1.0, neg / max(1, pos))
+    print(f"[Info] Train={train.shape}, Pos={pos}, Neg={neg}, scale_pos_weight={scale_pos_weight:.2f}")
+
+    woe=WOETransformer(max_bins=10, min_bin_frac=0.03, rare_frac=0.01, alpha=0.5).fit(X,y)
+    woe.iv_table_.to_csv(os.path.join(OUT,"iv_table_xgboost.csv"), index=False, encoding="utf-8")
+    Xw=woe.transform(X)
+
+    if RandomUnderSampler is not None:
+        sampler=RandomUnderSampler(random_state=RANDOM_STATE, sampling_strategy=0.5)
+    else:
+        sampler="passthrough"
+        warnings.warn("imblearn 未安装，跳过欠采样。")
+
+    base_model=XGBClassifier(
+        n_estimators=1000,
+        learning_rate=0.03,
+        subsample=0.9,
         colsample_bytree=0.8,
-        reg_lambda=1.0,
+        max_depth=5,
+        min_child_weight=1.0,
+        reg_alpha=0.0,
+        reg_lambda=2.0,
         objective="binary:logistic",
-        scale_pos_weight=spw,
         eval_metric="auc",
-        random_state=42,
-        n_jobs=-1
-    ))
-])
+        tree_method="hist",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        scale_pos_weight=scale_pos_weight
+    )
 
-clf.fit(X_train, y_train)
-y_prob = clf.predict_proba(X_valid)[:, 1]
-auc = roc_auc_score(y_valid, y_prob)
-ap = average_precision_score(y_valid, y_prob)
-ks = ks_score(y_valid, y_prob)
-print(f"[XGBoost] AUC={auc:.4f}  AP={ap:.4f}  KS={ks:.4f}")
+    if sampler == "passthrough":
+        pipe=SkPipeline([("clf", base_model)])
+    else:
+        pipe=Pipeline([("sampler", sampler), ("clf", base_model)])
 
-prob_test = clf.predict_proba(test[cat_cols+num_cols])[:, 1]
-sample["target"] = prob_test
-out_path = os.path.join(OUT, "submission_xgboost.csv")
-sample.to_csv(out_path, index=False)
-print("✅ 概率预测文件：", out_path)
+    skf=StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    oof=np.zeros(len(Xw), float)
+    for i,(tr,va) in enumerate(skf.split(Xw,y),1):
+        p=clone(pipe)
+        p.fit(Xw.iloc[tr], y[tr])
+        oof[va]=p.predict_proba(Xw.iloc[va])[:,1]
+        auc=roc_auc_score(y[va], oof[va]); ap=average_precision_score(y[va], oof[va]); ks=ks_score(y[va], oof[va])
+        print(f"[Fold {i}] AUC={auc:.4f} AP={ap:.4f} KS={ks:.4f}")
+    auc=roc_auc_score(y,oof); ap=average_precision_score(y,oof); ks=ks_score(y,oof)
+    print(f"[OOF] AUC={auc:.4f} AP={ap:.4f} KS={ks:.4f}")
+    pipe.fit(Xw,y)
 
-ohe = clf.named_steps["pre"].named_transformers_["cat"].named_steps["ohe"]
-cat_feature_names = ohe.get_feature_names_out(cat_cols)
-feature_names = np.concatenate([num_cols, cat_feature_names])
-imp = clf.named_steps["clf"].feature_importances_
-imp_df = pd.DataFrame({"feature": feature_names, "importance": imp}).sort_values("importance", ascending=False).head(30)
+    t_num=pd.DataFrame(imp_num.transform(test[num_cols]), columns=num_cols, index=test.index)
+    t_cat=pd.DataFrame(imp_cat.transform(test[cat_cols]), columns=cat_cols, index=test.index) if cat_cols else pd.DataFrame(index=test.index)
+    tX=pd.concat([t_cat, t_num], axis=1)
+    tXw=woe.transform(tX)
 
-plt.figure(figsize=(9,7))
-plt.barh(imp_df["feature"], imp_df["importance"])
-plt.gca().invert_yaxis()
-plt.title("Top 30 Feature Importances (XGBoost)")
-plt.tight_layout()
-plt.savefig(os.path.join(OUT, "xgboost_feature_importance.png"), dpi=220)
-plt.close()
-print("📊 特征重要性图已保存。")
+    prob=pipe.predict_proba(tXw)[:,1]
+    sub=pd.read_csv(SAMPLE_CSV)
+    sub["target"]=prob
+    out_path=os.path.join(OUT,"submission_xgboost.csv")
+    sub.to_csv(out_path, index=False, float_format="%.8f", encoding="utf-8")
+    print("✅ 概率预测文件：", out_path)
+
+    # OOF
+    pd.DataFrame({"id": train[id_col], "oof": oof, "target": y}).to_csv(os.path.join(OUT,"oof_xgboost.csv"), index=False, encoding="utf-8")
+
+    # Feature importance
+    imp = pipe.named_steps["clf"].feature_importances_
+    fi = pd.DataFrame({"feature": Xw.columns, "importance": imp}).sort_values("importance", ascending=False).head(30)
+    plt.figure(figsize=(9,7)); plt.barh(fi["feature"], fi["importance"]); plt.gca().invert_yaxis()
+    plt.title("Top 30 Feature Importances (XGBoost)"); plt.tight_layout()
+    plt.savefig(os.path.join(OUT, "xgboost_feature_importance.png"), dpi=220); plt.close()
+    print("📊 特征重要性图已保存。")
+
+if __name__ == "__main__":
+    main()
