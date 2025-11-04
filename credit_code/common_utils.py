@@ -6,12 +6,13 @@ from sklearn.metrics import (
     roc_curve, confusion_matrix, classification_report
 )
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame: #功能是规范化列名
+    """规范化列名：去除空格，转小写"""
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
-def add_business_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_business_features(df: pd.DataFrame) -> pd.DataFrame: #功能是添加业务特征
     """业务向特征增强：使用率/比率/倒数特征等"""
     df = df.copy()
     # 信用卡使用率
@@ -50,23 +51,23 @@ def add_business_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def split_feature_columns(df: pd.DataFrame, target_col="target"):
+def split_feature_columns(df: pd.DataFrame, target_col="target"): #功能是划分数值型和类别型特征
     cat_cols = [c for c in df.columns if df[c].dtype == "object" and c != target_col]
     num_cols = [c for c in df.columns if c not in cat_cols + [target_col]]
     if "id" in num_cols:
         num_cols.remove("id")
     return cat_cols, num_cols
 
-def ks_score(y_true, y_prob):
+def ks_score(y_true, y_prob): #功能是计算KS值
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     return float(np.max(np.abs(tpr - fpr)))
 
-def best_thr_by_ks(y_true, y_prob):
+def best_thr_by_ks(y_true, y_prob): #功能是计算KS值对应的最佳阈值
     fpr, tpr, th = roc_curve(y_true, y_prob)
     ks_vals = np.abs(tpr - fpr)
     return float(th[np.argmax(ks_vals)])
 
-def evaluate_and_plot(model_name, y_true, y_prob, out_dir):
+def evaluate_and_plot(model_name, y_true, y_prob, out_dir): #功能是评估模型并绘制图表
     os.makedirs(out_dir, exist_ok=True)
     auc_v = roc_auc_score(y_true, y_prob)
     prec, rec, _ = precision_recall_curve(y_true, y_prob)

@@ -1,0 +1,6 @@
+模型名称,AUC,AP,KS
+train_logistic,0.7276,0.0418,0.6667
+train_extratrees,0.6565,0.0389,0.4309
+train_xgboost,0.4593,0.0257,0.3374
+train_linear_regression,0.5565,0.0179,0.5565
+ensemble_submission_top2,0.47040816326530616,0.021178287488987483,0.1653061224489796
