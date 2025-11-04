@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedShuffleSplit, GridSearchCV
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
+from sklearn.base import clone
 
 BASE_DIR = "/Users/krt/krt files/Github/new_stat/credit_code"
 ROOT_DIR = os.path.dirname(BASE_DIR)
@@ -76,47 +77,89 @@ cat_cols = [c for c in train.columns if train[c].dtype=="object" and c!=target_c
 num_cols = [c for c in train.columns if c not in cat_cols + [target_col]]
 if "id" in num_cols: num_cols.remove("id")
 
-X, y = train[cat_cols+num_cols], train[target_col].astype(int)
-X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+X = train[cat_cols + num_cols].reset_index(drop=True)
+y = train[target_col].astype(int).reset_index(drop=True)
 
 num_tf = Pipeline([("imp", SimpleImputer(strategy="median"))])  # 树模型不需要标准化
-cat_tf = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore"))])
+cat_tf = Pipeline([
+    ("imp", SimpleImputer(strategy="most_frequent")),
+    ("ohe", OneHotEncoder(handle_unknown="ignore"))
+])
 pre = ColumnTransformer([("num", num_tf, num_cols), ("cat", cat_tf, cat_cols)])
 
-clf = Pipeline([
+pipeline = Pipeline([
     ("pre", pre),
-    ("clf", ExtraTreesClassifier(
-        n_estimators=500,
-        max_features=None,
+    ("clf", RandomForestClassifier(
+        n_estimators=400,
+        max_depth=None,
+        min_samples_split=2,
+        max_features="sqrt",
         class_weight="balanced_subsample",
         random_state=42,
         n_jobs=-1
     ))
 ])
 
-clf.fit(X_train, y_train)
-y_prob = clf.predict_proba(X_valid)[:, 1]
-auc = roc_auc_score(y_valid, y_prob)
-ap = average_precision_score(y_valid, y_prob)
-ks = ks_score(y_valid, y_prob)
-print(f"[ExtraTrees] AUC={auc:.4f}  AP={ap:.4f}  KS={ks:.4f}")
+# ===============================
+# 10 次随机划分 + 参数搜索
+# ===============================
+cv_inner = StratifiedShuffleSplit(n_splits=10, test_size=0.25, random_state=42)
+param_grid = {
+    "clf__n_estimators": [300, 450],
+    "clf__max_depth": [None, 18],
+    "clf__min_samples_split": [2, 5],
+    "clf__max_features": ["sqrt", 0.5]
+}
 
-prob_test = clf.predict_proba(test[cat_cols+num_cols])[:, 1]
+print("🌲 随机森林：开始 10 次随机划分 + 网格搜索调参（指标：AUC）...")
+grid = GridSearchCV(
+    pipeline,
+    param_grid=param_grid,
+    scoring="roc_auc",
+    cv=cv_inner,
+    n_jobs=-1,
+    refit=True,
+    verbose=0
+)
+grid.fit(X, y)
+best_model = grid.best_estimator_
+print(f"✅ 最优参数：{grid.best_params_}，平均AUC={grid.best_score_:.4f}")
+
+cv_eval = StratifiedShuffleSplit(n_splits=10, test_size=0.25, random_state=123)
+auc_scores, ap_scores, ks_scores = [], [], []
+for fold_idx, (tr_idx, val_idx) in enumerate(cv_eval.split(X, y), 1):
+    model = clone(best_model)
+    model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+    y_prob = model.predict_proba(X.iloc[val_idx])[:, 1]
+    y_val = y.iloc[val_idx]
+    auc_scores.append(roc_auc_score(y_val, y_prob))
+    ap_scores.append(average_precision_score(y_val, y_prob))
+    ks_scores.append(ks_score(y_val, y_prob))
+
+auc = float(np.mean(auc_scores))
+ap = float(np.mean(ap_scores))
+ks = float(np.mean(ks_scores))
+print(f"[RandomForest] CV AUC={auc:.4f}  AP={ap:.4f}  KS={ks:.4f}")
+
+best_model.fit(X, y)
+
+prob_test = best_model.predict_proba(test[cat_cols+num_cols])[:, 1]
+prob_test = np.where(prob_test < 0.1, prob_test / 10.0, prob_test)
 sample["target"] = prob_test
 out_path = os.path.join(OUT, "submission_extra_trees.csv")
 sample.to_csv(out_path, index=False)
 print("✅ 概率预测文件：", out_path)
 
-ohe = clf.named_steps["pre"].named_transformers_["cat"].named_steps["ohe"]
+ohe = best_model.named_steps["pre"].named_transformers_["cat"].named_steps["ohe"]
 cat_feature_names = ohe.get_feature_names_out(cat_cols)
 feature_names = np.concatenate([num_cols, cat_feature_names])
-imp = clf.named_steps["clf"].feature_importances_
+imp = best_model.named_steps["clf"].feature_importances_
 imp_df = pd.DataFrame({"feature": feature_names, "importance": imp}).sort_values("importance", ascending=False).head(30)
 
 plt.figure(figsize=(9,7))
 plt.barh(imp_df["feature"], imp_df["importance"])
 plt.gca().invert_yaxis()
-plt.title("Top 30 Feature Importances (ExtraTrees)")
+plt.title("Top 30 Feature Importances (RandomForest)")
 plt.tight_layout()
 plt.savefig(os.path.join(OUT, "extratrees_feature_importance.png"), dpi=220)
 plt.close()
